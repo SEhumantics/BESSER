@@ -1,0 +1,118 @@
+# Activity Diagram — implementation roadmap & backlog
+
+A **general-purpose, class-bindable** UML-inspired Activity Diagram language for the
+B-UML family. Usable standalone (a flowchart for documentation / interchange /
+structural validation) and bindable to the class model (executable nodes carry an
+optional `ref_class`/`ref_method`/`ref_property`; the activity carries an optional
+`context` owning class). The node/edge hierarchy is open for subclassing, so a
+specialized DSL can extend it in a sibling module (`activity/<dsl>.py`, mirroring
+`state_machine` → `agent`) without changing this package. Guards and action bodies
+are **stringly** `OpaqueExpression` (`body` + optional `language` tag: a plain label
+when unbound, e.g. OCL when class-bound) — the general model is executable-free.
+
+## Phase status
+
+- [x] **Phase 0 — Metamodel + `validate()`** — `activity.py` + `__init__.py`. Self-contained
+      (imports only from `structural`; no `state_machine`). Control-flow core nodes/edges,
+      `OpaqueExpression` guards/bodies, class-diagram binding on `ExecutableNode`, owning
+      `context`, `ActivityElement`/`layout`, `{success, errors, warnings}` contract with
+      E1–E14/W1–W3. Adversarially reviewed + quality-audited + PR-review-hardened (clean);
+      94 tests green (99% line coverage), CI-ruff clean. **Done on `feat/activity-phase0`.**
+- [ ] **Phase 1 — JSON⇄BUML converters** — symmetric pair with round-trip (TDD):
+      `services/converters/json_to_buml/activity_diagram_processor.py` ↔
+      `services/converters/buml_to_json/activity_diagram_converter.py`; register in the
+      `__init__.py` files; discriminator string `"ActivityDiagram"`. Serialization notes:
+      `OpaqueExpression` → `{body, language}`; `layout` dict rides through; bindings
+      (`ref_class`/`ref_method`/`ref_property`/`context`) serialize **by name** and re-resolve
+      against the active ClassDiagram `DomainModel`. `ref_method`/`ref_property` are
+      **class-scoped** → use class-qualified names; there is no invariant that they belong to
+      `ref_class`, so define an explicit resolution + (warning-level) consistency policy.
+- [ ] **Phase 2 — Project + router dispatch wiring** — `constants.py` discriminator, both
+      project converters, `conversion_router` (`/export-buml`, `/get-json-model` auto-detect),
+      `validation_router` (`/validate-diagram`). Cross-diagram class-ref resolution reuses the
+      per-diagram references map (as `deployment.domain_model` / `gui.DataBinding` do).
+- [ ] **Phase 3 — Generator** — *out of scope for v1* (like `state_machine`). Class-less
+      activities generate skeletons only; real generation needs binding. Revisit later.
+- [ ] **Phase 4 — Frontend palette** — extend the editor with explicit Decision / Join /
+      FlowFinal node types (decision: *extend*, not infer); stringly guard/body fields;
+      class/method pickers on actions; owning-class selector; persist `layout`. Separate submodule PR.
+- [ ] **Phase 5 — Docs** — `buml_language`, `web_editor(_backend)` entries; `make html`.
+- [ ] **(Post-v1) Specialized DSL sibling** — `activity/<dsl>.py` subclasses the base to add
+      *mandatory* binding, OCL contracts (pre/post as `structural.Constraint`), state-matching
+      sequencing, and a restricted node profile; overrides `validate()` via `super()`.
+
+## Metamodel — deferred items (intentional)
+
+- [ ] **Object flow / object nodes / pins / data store** (IMPORTANT tier) — add as
+      `ActivityEdge`/`ExecutableNode` subclasses when needed; abstract groupings already in place.
+- [ ] **CallBehaviorAction, Accept/Send event actions, StructuredActivityNode** (IMPORTANT tier)
+      — add via the open `Action` hierarchy + `super().validate()`.
+- [ ] **Action local pre/postconditions** — DEFERRED to the DSL sibling as OCL
+      `structural.Constraint` (context = the action's bound class). The general model stays
+      executable-/OCL-free.
+- [ ] **`ref_method`/`ref_property` ∈ `ref_class` consistency** — no invariant enforced; consider
+      a `validate()` WARNING (degrade-gracefully, not a hard error) once binding resolution lands.
+- [ ] **`ActivityPartition`/swimlanes, activity Variables, `ActivityParameterNode`** (OPTIONAL tier).
+- [ ] **W6 no-default-decision warning** — not implemented (would be noisy on exhaustive decisions).
+- [ ] **Edge-name uniqueness** — not enforced (nodes unique by name; edges auto-name `e_N`).
+- [ ] **Post-insert node rename** — bypasses uniqueness (caught later by E13).
+- [ ] **`OpaqueExpression` mutability** — defines `__eq__`/`__hash__` but is mutable; treat as a
+      value object (don't mutate one held in a set). Freeze only if a converter dedups them.
+- [ ] **Empty-string guard** — `guard=""` coerces to a non-None `OpaqueExpression`, so a branch is
+      treated as guarded. Acceptable; revisit if the editor can emit empty guards.
+
+## Test backlog
+
+Covered as of the PR-review pass (94 tests, 99% line coverage): FlowFinalNode happy-path + E4;
+`weight` rejection (bool/float/str); bulk `nodes=`/`edges=` setter paths (duplicate/foreign/
+wrong-type/back-link happy-path); edge foreign-ownership guard; control-node arity branches
+BOTH directions (E5–E8 fan-in and fan-out); isolated E3/W2/E14; E10 missing-endpoint +
+source/target-side; `add_node`/`add_edge` type guards; `is_default` non-bool; `ref_class`/
+`ref_property` type rejection; `connect()` foreign source+target; `OpaqueExpression` language
+rejection; detached `incoming()/outgoing()`; edge `visibility` default; `timestamp` passthrough.
+Remaining:
+
+- [ ] `FlowFinalNode` reachability warning (W3) in a mixed model (minor).
+- [ ] `OpaqueExpression` with `language` round-trips through the Phase-1 converter (deferred to P1).
+- [x] E13 (duplicate node names in `validate()`) — reachable via a post-insert rename
+      (`node.name = <existing>` bypasses insertion-time uniqueness); now covered by a test.
+
+## Locked design decisions (context for contributors)
+
+- **General-purpose + class-bindable** (not class-bound-mandatory). Binding is a first-class
+  *nullable* feature (the `gui.DataBinding` stance), not DSL-only. UML `Activity` is a
+  `Behavior` with a `context`; BESSER is domain-centric — but `bpmn` (the closest flow sibling)
+  is deliberately domain-free, so binding stays optional here.
+- **Fully self-contained** — imports only from `structural`, never `state_machine`.
+- **Guards & action bodies are stringly `OpaqueExpression`** (`body` + optional `language`),
+  NOT executable code and NOT OCL-in-the-base. A plain `str` is coerced to an untagged
+  expression; `language="OCL"` when class-bound. The DSL sibling attaches evaluation/analysis.
+- **Class-diagram binding on `ExecutableNode`** (action/object-executing nodes), NOT the abstract
+  base — control nodes route tokens and carry no binding (matches `object.Instance.classifier`
+  placement + `gui`'s refusal to put `ref_class` on every widget).
+- **`ActivityModel.context`** = optional owning/behaviored `Class` (UML `Behavior.context`) and the
+  natural OCL evaluation context for a class-bound activity.
+- **`ActivityElement(NamedElement)`** intermediate base (mirrors `bpmn.BPMNElement`) with an opaque
+  `layout` interchange passthrough (never interpreted by `validate()`).
+- Node `name` is identifier-safe (spaces/hyphens rejected); human-readable text goes in `label`.
+- **Edges are the single source of truth**; nodes expose derived `incoming()`/`outgoing()`.
+- No `__eq__`/`__hash__` on nodes/edges; uniqueness enforced by-name in `ActivityModel` setters/factories.
+- Abstract bases guard instantiation with `if type(self) is X: raise TypeError` (rejects only direct
+  instantiation, not subclasses; matches `bpmn`).
+
+## Settled tradeoffs (already considered & rejected — don't re-open without a new reason)
+
+- **Stringly `OpaqueExpression` guards/bodies, not executable code.** An executable predicate only
+  earns its complexity if something *runs* it; a modeling diagram's guard is a label/query. Rejected
+  copying `state_machine`'s executable `Condition` (its rationale is agent-runtime-specific).
+- **No OCL in the general model.** OCL needs a class context and adds a second predicate language;
+  OCL contracts + analysis belong to a class-bound specialized layer, not the general base. The
+  `language` tag on `OpaqueExpression` leaves the door open (`language="OCL"` when bound).
+- **Binding on `ExecutableNode`, not the abstract base.** Control nodes route tokens and have nothing
+  in the domain model to bind to; the family binds where the whole subtree needs it
+  (cf. `object.Instance.classifier`; `gui` refuses `ref_class` on every widget).
+- **Class-*bindable*, not class-bound-mandatory.** A flow diagram is meaningful standalone (cf. the
+  domain-free `bpmn`); binding is a first-class *nullable* enrichment (the `gui.DataBinding` stance),
+  not required and not specialization-only.
+- **Lean V1.** Object flow / pins / events / structured nodes are deferred, not dropped — the open
+  abstract groupings let a later phase or a specialized sibling add them with no base refactor.
