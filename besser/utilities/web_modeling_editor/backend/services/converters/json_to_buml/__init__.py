@@ -10,6 +10,7 @@ from .agent_diagram_processor import process_agent_diagram
 # `from . import (..., process_bpmn_diagram)` to wire BPMN into project conversion, so
 # the name has to be present in this package's namespace when project_converter loads.
 from .bpmn_diagram_processor import process_bpmn_diagram
+from .activity_diagram_processor import process_activity_diagram
 from .gui_diagram_processor import process_gui_diagram
 from .quantum_diagram_processor import process_quantum_diagram
 from .nn_diagram_processor import process_nn_diagram
@@ -27,4 +28,5 @@ __all__ = [
     'process_quantum_diagram',
     'process_nn_diagram',
     'process_bpmn_diagram',
+    'process_activity_diagram',
 ]

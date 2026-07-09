@@ -34,6 +34,15 @@ from besser.utilities.web_modeling_editor.backend.services.converters.json_to_bu
 from besser.utilities.web_modeling_editor.backend.services.converters.buml_to_json.nn_diagram_converter import (
     nn_model_to_json,
 )
+from besser.utilities.web_modeling_editor.backend.services.converters.json_to_buml.activity_diagram_processor import (
+    process_activity_diagram,
+)
+from besser.utilities.web_modeling_editor.backend.services.converters.buml_to_json.activity_diagram_converter import (
+    activity_object_to_json,
+    activity_to_json,
+)
+from besser.utilities.buml_code_builder.activity_model_builder import activity_model_to_code
+from besser.BUML.metamodel.activity.activity import ActivityModel
 
 
 # ---------------------------------------------------------------------------
@@ -2076,3 +2085,320 @@ class TestNNDiagramRoundtrip:
         ])
         with pytest.raises(ValueError, match=r"optimizer.*Allowed values"):
             process_nn_diagram(payload)
+
+
+# ===========================================================================
+# Activity Diagram Roundtrip Tests
+# ===========================================================================
+
+def _activity_node(el_id, name, el_type):
+    return {"id": el_id, "name": name, "type": el_type, "owner": None,
+            "bounds": {"x": 0, "y": 0, "width": 100, "height": 60}}
+
+
+def _activity_flow(rel_id, name, src, tgt):
+    return {"id": rel_id, "name": name, "type": "ActivityControlFlow", "owner": None,
+            "source": {"element": src, "direction": "Right"},
+            "target": {"element": tgt, "direction": "Left"}}
+
+
+@pytest.fixture
+def activity_diagram_json():
+    """A control-flow activity exercising all four topology disambiguations.
+
+    initial -> validate -> {decision} -[approved]-> approve -\\
+                                       -[rejected]-> reject  --> {merge} -> {fork}
+    {fork} -> logIt, notify -> {join} -> final
+
+    The two diamonds (``ActivityMergeNode``) must come back as a DecisionNode
+    (fan-out, guarded) and a MergeNode (fan-in); the two bars
+    (``ActivityForkNode``) as a ForkNode (fan-out) and a JoinNode (fan-in).
+    """
+    return {
+        "title": "ApprovalActivity",
+        "model": {
+            "elements": {
+                "n-init": _activity_node("n-init", "", "ActivityInitialNode"),
+                "n-validate": _activity_node("n-validate", "validate", "ActivityActionNode"),
+                "n-decision": _activity_node("n-decision", "", "ActivityMergeNode"),
+                "n-approve": _activity_node("n-approve", "approve", "ActivityActionNode"),
+                "n-reject": _activity_node("n-reject", "reject", "ActivityActionNode"),
+                "n-merge": _activity_node("n-merge", "", "ActivityMergeNode"),
+                "n-fork": _activity_node("n-fork", "", "ActivityForkNode"),
+                "n-log": _activity_node("n-log", "logIt", "ActivityActionNode"),
+                "n-notify": _activity_node("n-notify", "notify", "ActivityActionNode"),
+                "n-join": _activity_node("n-join", "", "ActivityForkNode"),
+                "n-final": _activity_node("n-final", "", "ActivityFinalNode"),
+            },
+            "relationships": {
+                "e1": _activity_flow("e1", "", "n-init", "n-validate"),
+                "e2": _activity_flow("e2", "", "n-validate", "n-decision"),
+                "e3": _activity_flow("e3", "approved", "n-decision", "n-approve"),
+                "e4": _activity_flow("e4", "rejected", "n-decision", "n-reject"),
+                "e5": _activity_flow("e5", "", "n-approve", "n-merge"),
+                "e6": _activity_flow("e6", "", "n-reject", "n-merge"),
+                "e7": _activity_flow("e7", "", "n-merge", "n-fork"),
+                "e8": _activity_flow("e8", "", "n-fork", "n-log"),
+                "e9": _activity_flow("e9", "", "n-fork", "n-notify"),
+                "e10": _activity_flow("e10", "", "n-log", "n-join"),
+                "e11": _activity_flow("e11", "", "n-notify", "n-join"),
+                "e12": _activity_flow("e12", "", "n-join", "n-final"),
+            },
+        },
+    }
+
+
+def _activity_degrees(json_result):
+    """Return (in_degree, out_degree) dicts keyed by element id from the result."""
+    in_deg, out_deg = {}, {}
+    for r in _extract_relationships_by_type(json_result, "ActivityControlFlow"):
+        s = r["source"]["element"]
+        t = r["target"]["element"]
+        out_deg[s] = out_deg.get(s, 0) + 1
+        in_deg[t] = in_deg.get(t, 0) + 1
+    return in_deg, out_deg
+
+
+class TestActivityDiagramRoundtrip:
+    """JSON -> BUML -> JSON roundtrip for activity diagrams."""
+
+    def test_action_nodes_preserved(self, activity_diagram_json):
+        """Action node display names survive the roundtrip."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        actions = _extract_elements_by_type(result, "ActivityActionNode")
+        assert {a["name"] for a in actions} == {"validate", "approve", "reject", "logIt", "notify"}
+
+    def test_initial_and_final_preserved(self, activity_diagram_json):
+        """Exactly one initial and one final node survive."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        assert len(_extract_elements_by_type(result, "ActivityInitialNode")) == 1
+        assert len(_extract_elements_by_type(result, "ActivityFinalNode")) == 1
+
+    def test_diamonds_disambiguated(self, activity_diagram_json):
+        """The two diamonds come back as one fan-out (decision) and one fan-in (merge)."""
+        model = process_activity_diagram(activity_diagram_json)
+        # Metamodel side: exactly one DecisionNode and one MergeNode.
+        from besser.BUML.metamodel.activity.activity import DecisionNode, MergeNode
+        assert len([n for n in model.nodes if type(n) is DecisionNode]) == 1
+        assert len([n for n in model.nodes if type(n) is MergeNode]) == 1
+
+        # JSON side: both render as ActivityMergeNode; one fans out, one fans in.
+        result = activity_object_to_json(model)
+        diamonds = _extract_elements_by_type(result, "ActivityMergeNode")
+        assert len(diamonds) == 2
+        in_deg, out_deg = _activity_degrees(result)
+        shapes = {(in_deg.get(d["id"], 0), out_deg.get(d["id"], 0)) for d in diamonds}
+        assert (1, 2) in shapes  # decision: 1 in, 2 out
+        assert (2, 1) in shapes  # merge: 2 in, 1 out
+
+    def test_bars_disambiguated(self, activity_diagram_json):
+        """The two bars come back as one ForkNode (fan-out) and one JoinNode (fan-in)."""
+        model = process_activity_diagram(activity_diagram_json)
+        from besser.BUML.metamodel.activity.activity import ForkNode, JoinNode
+        assert len([n for n in model.nodes if type(n) is ForkNode]) == 1
+        assert len([n for n in model.nodes if type(n) is JoinNode]) == 1
+
+        result = activity_object_to_json(model)
+        bars = _extract_elements_by_type(result, "ActivityForkNode")
+        assert len(bars) == 2
+        in_deg, out_deg = _activity_degrees(result)
+        shapes = {(in_deg.get(b["id"], 0), out_deg.get(b["id"], 0)) for b in bars}
+        assert (1, 2) in shapes  # fork
+        assert (2, 1) in shapes  # join
+
+    def test_guards_preserved(self, activity_diagram_json):
+        """Decision-branch guards survive as control-flow edge names."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        flows = _extract_relationships_by_type(result, "ActivityControlFlow")
+        guard_names = {f["name"] for f in flows if f["name"]}
+        assert guard_names == {"approved", "rejected"}
+
+    def test_control_flow_count(self, activity_diagram_json):
+        """All control-flow edges survive the roundtrip."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        assert len(_extract_relationships_by_type(result, "ActivityControlFlow")) == 12
+
+    def test_diagram_type_preserved(self, activity_diagram_json):
+        """The output JSON has the correct diagram type."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        assert result["type"] == "ActivityDiagram"
+
+    def test_double_roundtrip_stable(self, activity_diagram_json):
+        """Two consecutive roundtrips produce equivalent essential data."""
+        model1 = process_activity_diagram(activity_diagram_json)
+        json1 = activity_object_to_json(model1)
+
+        json1_input = {"title": "ApprovalActivity", "model": json1}
+        model2 = process_activity_diagram(json1_input)
+        json2 = activity_object_to_json(model2)
+
+        def _type_counts(j):
+            counts = {}
+            for e in _resolve_elements(j).values():
+                counts[e["type"]] = counts.get(e["type"], 0) + 1
+            return counts
+
+        assert _type_counts(json1) == _type_counts(json2)
+
+        guards1 = {f["name"] for f in _extract_relationships_by_type(json1, "ActivityControlFlow") if f["name"]}
+        guards2 = {f["name"] for f in _extract_relationships_by_type(json2, "ActivityControlFlow") if f["name"]}
+        assert guards1 == guards2 == {"approved", "rejected"}
+
+    def test_guard_edge_wiring_preserved(self, activity_diagram_json):
+        """The guard edges connect the decision diamond to the right action, by identity."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        elements = _resolve_elements(result)
+        # Map each guard name to the display name of its target element.
+        guarded = {}
+        for f in _extract_relationships_by_type(result, "ActivityControlFlow"):
+            if f["name"]:
+                guarded[f["name"]] = elements[f["target"]["element"]]["name"]
+        assert guarded == {"approved": "approve", "rejected": "reject"}
+
+
+class TestActivityConverterEdgeCases:
+    """Disambiguation / sanitization edge cases surfaced by review."""
+
+    def test_hyphenated_title_accepted(self):
+        """A title with a hyphen is sanitized, not rejected (regression: HTTP 400)."""
+        json_data = {
+            "title": "Order-Flow",
+            "model": {
+                "elements": {
+                    "i": _activity_node("i", "", "ActivityInitialNode"),
+                    "a": _activity_node("a", "act", "ActivityActionNode"),
+                    "f": _activity_node("f", "", "ActivityFinalNode"),
+                },
+                "relationships": {
+                    "e1": _activity_flow("e1", "", "i", "a"),
+                    "e2": _activity_flow("e2", "", "a", "f"),
+                },
+            },
+        }
+        model = process_activity_diagram(json_data)  # must not raise
+        assert "-" not in model.name and " " not in model.name
+        assert activity_object_to_json(model)["type"] == "ActivityDiagram"
+
+    def test_object_node_edge_does_not_inflate_diamond(self):
+        """A diamond with one real out-branch + one edge to a skipped object node
+        stays a MergeNode (pass-through), not a DecisionNode (regression: degree
+        inflation from unfiltered relationships)."""
+        from besser.BUML.metamodel.activity.activity import DecisionNode, MergeNode
+        json_data = {
+            "title": "Passthrough",
+            "model": {
+                "elements": {
+                    "i": _activity_node("i", "", "ActivityInitialNode"),
+                    "a": _activity_node("a", "act", "ActivityActionNode"),
+                    "d": _activity_node("d", "", "ActivityMergeNode"),
+                    "b": _activity_node("b", "after", "ActivityActionNode"),
+                    "obj": _activity_node("obj", "data", "ActivityObjectNode"),  # skipped
+                    "f": _activity_node("f", "", "ActivityFinalNode"),
+                },
+                "relationships": {
+                    "e1": _activity_flow("e1", "", "i", "a"),
+                    "e2": _activity_flow("e2", "", "a", "d"),
+                    "e3": _activity_flow("e3", "", "d", "b"),      # only real out-branch
+                    "e4": _activity_flow("e4", "", "d", "obj"),    # out to a skipped node
+                    "e5": _activity_flow("e5", "", "b", "f"),
+                },
+            },
+        }
+        model = process_activity_diagram(json_data)
+        assert [n for n in model.nodes if type(n) is DecisionNode] == []
+        assert len([n for n in model.nodes if type(n) is MergeNode]) == 1
+
+    def test_empty_decision_branch_becomes_default(self):
+        """A decision out-branch with an empty name becomes the default 'else'."""
+        from besser.BUML.metamodel.activity.activity import DecisionNode
+        json_data = {
+            "title": "DefaultBranch",
+            "model": {
+                "elements": {
+                    "i": _activity_node("i", "", "ActivityInitialNode"),
+                    "d": _activity_node("d", "", "ActivityMergeNode"),
+                    "a": _activity_node("a", "yes_action", "ActivityActionNode"),
+                    "b": _activity_node("b", "else_action", "ActivityActionNode"),
+                    "m": _activity_node("m", "", "ActivityMergeNode"),
+                    "f": _activity_node("f", "", "ActivityFinalNode"),
+                },
+                "relationships": {
+                    "e1": _activity_flow("e1", "", "i", "d"),
+                    "e2": _activity_flow("e2", "yes", "d", "a"),   # guarded branch
+                    "e3": _activity_flow("e3", "", "d", "b"),        # empty -> default
+                    "e4": _activity_flow("e4", "", "a", "m"),
+                    "e5": _activity_flow("e5", "", "b", "m"),
+                    "e6": _activity_flow("e6", "", "m", "f"),
+                },
+            },
+        }
+        model = process_activity_diagram(json_data)
+        decision = next(n for n in model.nodes if type(n) is DecisionNode)
+        outs = decision.outgoing()
+        defaults = [e for e in outs if e.is_default]
+        guarded = [e for e in outs if e.guard is not None]
+        assert len(defaults) == 1 and defaults[0].guard is None
+        assert len(guarded) == 1 and guarded[0].guard.body == "yes"
+
+    def test_empty_display_name_roundtrips_as_empty(self, activity_diagram_json):
+        """A node with an empty display name comes back empty, not as its identifier."""
+        model = process_activity_diagram(activity_diagram_json)
+        result = activity_object_to_json(model)
+        initials = _extract_elements_by_type(result, "ActivityInitialNode")
+        assert initials and all(n["name"] == "" for n in initials)
+
+
+class TestActivityFileImport:
+    """The AST-based file-import path (activity_to_json), used by /get-json-model."""
+
+    def test_roundtrip_via_generated_code(self, activity_diagram_json):
+        """Builder output parses back to equivalent JSON without exec'ing the file."""
+        model = process_activity_diagram(activity_diagram_json)
+        imported = activity_to_json(activity_model_to_code(model))
+        assert imported["type"] == "ActivityDiagram"
+        assert {a["name"] for a in _extract_elements_by_type(imported, "ActivityActionNode")} == {
+            "validate", "approve", "reject", "logIt", "notify"}
+        guards = {f["name"] for f in _extract_relationships_by_type(imported, "ActivityControlFlow") if f["name"]}
+        assert guards == {"approved", "rejected"}
+
+    def test_default_branch_and_guard_parsed(self):
+        """is_default / guard kwargs on connect() are parsed from source."""
+        code = (
+            "from besser.BUML.metamodel.activity.activity import ActivityModel\n"
+            "activity = ActivityModel(name='Guarded')\n"
+            "i_node = activity.new_initial(name='i')\n"
+            "d_node = activity.new_decision(name='d')\n"
+            "a_node = activity.new_action(name='a')\n"
+            "b_node = activity.new_action(name='b')\n"
+            "f_node = activity.new_activity_final(name='f')\n"
+            "activity.connect(i_node, d_node, name='e_1')\n"
+            "activity.connect(d_node, a_node, guard='ok', name='e_2')\n"
+            "activity.connect(d_node, b_node, is_default=True, name='e_3')\n"
+            "activity.connect(a_node, f_node, weight=5, name='e_4')\n"
+            "activity.connect(b_node, f_node, name='e_5')\n"
+        )
+        result = activity_to_json(code)
+        flows = _extract_relationships_by_type(result, "ActivityControlFlow")
+        assert len(flows) == 5
+        # Only the guarded (non-default) decision branch surfaces a name.
+        assert {f["name"] for f in flows if f["name"]} == {"ok"}
+
+    def test_connect_without_name_kwarg_is_tolerated(self):
+        """A connect() call with no name kwarg auto-names and does not raise."""
+        code = (
+            "from besser.BUML.metamodel.activity.activity import ActivityModel\n"
+            "activity = ActivityModel(name='NoName')\n"
+            "i_node = activity.new_initial(name='i')\n"
+            "a_node = activity.new_action(name='a')\n"
+            "f_node = activity.new_activity_final(name='f')\n"
+            "activity.connect(i_node, a_node)\n"
+            "activity.connect(a_node, f_node)\n"
+        )
+        result = activity_to_json(code)  # must not raise
+        assert len(_extract_relationships_by_type(result, "ActivityControlFlow")) == 2

@@ -12,6 +12,7 @@ from besser.utilities.buml_code_builder.state_machine_builder import state_machi
 from besser.utilities.buml_code_builder.bpmn_model_builder import bpmn_model_to_code
 from besser.utilities.buml_code_builder.project_builder import project_to_code
 from besser.utilities.buml_code_builder.nn_model_builder import nn_model_to_code
+from besser.utilities.buml_code_builder.activity_model_builder import activity_model_to_code
 
 __all__ = [
     '_escape_python_string',
@@ -22,4 +23,5 @@ __all__ = [
     'bpmn_model_to_code',
     'project_to_code',
     'nn_model_to_code',
+    'activity_model_to_code',
 ]
